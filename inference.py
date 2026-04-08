@@ -355,7 +355,7 @@ async def main() -> None:
             if os.environ.get("LOG_DEBUG") == "1":
                 print(f"[DEBUG] unhandled_task_error task={task_id} error={exc}", flush=True)
             log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
-            log_end(success=False, steps=0, score=0.0, rewards=[])
+            log_end(success=False, steps=0, score=_strict_unit_score(0.0), rewards=[])
 
 
 if __name__ == "__main__":
