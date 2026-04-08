@@ -34,6 +34,7 @@ TASK_ORDER = [
 TEMPERATURE = 0
 MAX_TOKENS = 220
 SUCCESS_SCORE_THRESHOLD = 0.85
+STRICT_SCORE_EPS = float(os.getenv("STRICT_SCORE_EPS", "0.01"))
 
 SYSTEM_PROMPT = """You are an agent operating a privacy operations benchmark.
 Return exactly one compact JSON object describing the next action.
@@ -160,6 +161,19 @@ def _to_error_code(exc: Exception) -> str:
     if not name:
         return "runtime_error"
     return name
+
+
+def _strict_unit_score(value: float) -> float:
+    """Clamp score into strict open interval (0, 1)."""
+    try:
+        numeric = float(value)
+    except Exception:
+        numeric = 0.5
+    if numeric <= 0.0:
+        return STRICT_SCORE_EPS
+    if numeric >= 1.0:
+        return 1.0 - STRICT_SCORE_EPS
+    return numeric
 
 
 def get_model_action(
@@ -297,15 +311,16 @@ async def run_task(client: OpenAI | None, task_id: str) -> float:
             )
             if done:
                 break
-        score = float(
+        raw_score = float(
             result.observation.metadata.get("info", {}).get("final_score", result.reward or 0.0)
         )
+        score = _strict_unit_score(raw_score)
         success = score >= SUCCESS_SCORE_THRESHOLD
     except Exception as exc:
         if os.environ.get("LOG_DEBUG") == "1":
             print(f"[DEBUG] task_run_error task={task_id} error={exc}", flush=True)
         success = False
-        score = 0.0
+        score = _strict_unit_score(0.0)
     finally:
         if env is not None:
             try:
