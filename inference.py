@@ -21,6 +21,7 @@ LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
 HF_ROUTER_URL = os.getenv("HF_ROUTER_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DEFAULT_IMAGE_NAME = "privacyops-x:latest"
+DEFAULT_IMAGE_NAME_ALT = "privacyops_x:latest"
 API_KEY = OPENAI_API_KEY or HF_TOKEN or ""
 if not OPENAI_API_KEY and HF_TOKEN and HF_ROUTER_URL:
     API_BASE_URL = HF_ROUTER_URL
@@ -154,14 +155,21 @@ def fallback_policy(task_id: str, step: int) -> dict[str, Any]:
     return {"action_type": "submit"}
 
 
+def _to_error_code(exc: Exception) -> str:
+    name = exc.__class__.__name__.strip().lower()
+    if not name:
+        return "runtime_error"
+    return name
+
+
 def get_model_action(
-    client: OpenAI,
+    client: OpenAI | None,
     task_id: str,
     step: int,
     observation: PrivacyOpsObservation,
     history: list[str],
 ) -> dict[str, Any]:
-    if not API_KEY:
+    if not API_KEY or client is None:
         return fallback_policy(task_id, step)
     user_prompt = (
         f"Task: {task_id}\n"
@@ -200,16 +208,42 @@ def get_model_action(
 
 
 async def create_env() -> PrivacyOpsXEnv:
-    base_url = os.environ.get("ENV_BASE_URL")
+    base_url = os.getenv("ENV_BASE_URL")
     if base_url:
         client = PrivacyOpsXEnv(base_url=base_url)
         await client.connect()
         return client
-    return await PrivacyOpsXEnv.from_docker_image(LOCAL_IMAGE_NAME or DEFAULT_IMAGE_NAME)
+
+    image_candidates = [
+        LOCAL_IMAGE_NAME,
+        os.getenv("IMAGE_NAME"),
+        DEFAULT_IMAGE_NAME,
+        DEFAULT_IMAGE_NAME_ALT,
+    ]
+    seen: set[str] = set()
+    last_error: Exception | None = None
+    for image_name in image_candidates:
+        if not image_name or image_name in seen:
+            continue
+        seen.add(image_name)
+        try:
+            return await PrivacyOpsXEnv.from_docker_image(image_name)
+        except Exception as exc:
+            last_error = exc
+
+    for fallback_url in ("http://127.0.0.1:8000", "http://localhost:8000"):
+        try:
+            client = PrivacyOpsXEnv(base_url=fallback_url)
+            await client.connect()
+            return client
+        except Exception as exc:
+            last_error = exc
+
+    raise RuntimeError("Unable to initialize environment client") from last_error
 
 
-async def run_task(client: OpenAI, task_id: str) -> float:
-    env = await create_env()
+async def run_task(client: OpenAI | None, task_id: str) -> float:
+    env: PrivacyOpsXEnv | None = None
     history: list[str] = []
     rewards: list[float] = []
     steps_taken = 0
@@ -217,13 +251,33 @@ async def run_task(client: OpenAI, task_id: str) -> float:
     success = False
     log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
     try:
+        env = await create_env()
         result = await env.reset(task_id=task_id, seed=0)
         for step in range(1, 21):
             if result.done:
                 break
             action_payload = get_model_action(client, task_id, step, result.observation, history)
-            action = PrivacyOpsAction(**action_payload)
-            result = await env.step(action)
+            try:
+                action = PrivacyOpsAction(**action_payload)
+            except Exception:
+                action_payload = fallback_policy(task_id, step)
+                action = PrivacyOpsAction(**action_payload)
+            try:
+                result = await env.step(action)
+            except Exception as exc:
+                reward = 0.0
+                done = False
+                error = _to_error_code(exc)
+                rewards.append(reward)
+                steps_taken = step
+                log_step(
+                    step=step,
+                    action=json.dumps(action_payload, sort_keys=True),
+                    reward=reward,
+                    done=done,
+                    error=error,
+                )
+                break
             reward = float(result.reward or 0.0)
             done = bool(result.done)
             error = result.observation.metadata.get("info", {}).get("error_code")
@@ -241,29 +295,55 @@ async def run_task(client: OpenAI, task_id: str) -> float:
             )
             if done:
                 break
-        score = float(result.observation.metadata.get("info", {}).get("final_score", result.reward or 0.0))
+        score = float(
+            result.observation.metadata.get("info", {}).get("final_score", result.reward or 0.0)
+        )
         success = score >= SUCCESS_SCORE_THRESHOLD
+    except Exception as exc:
+        if os.environ.get("LOG_DEBUG") == "1":
+            print(f"[DEBUG] task_run_error task={task_id} error={exc}", flush=True)
+        success = False
+        score = 0.0
     finally:
-        try:
-            await env.close()
-        except Exception as exc:  # pragma: no cover
-            if os.environ.get("LOG_DEBUG") == "1":
-                print(f"[DEBUG] env.close() error (container cleanup): {exc}", flush=True)
+        if env is not None:
+            try:
+                await env.close()
+            except Exception as exc:  # pragma: no cover
+                if os.environ.get("LOG_DEBUG") == "1":
+                    print(f"[DEBUG] env.close() error (container cleanup): {exc}", flush=True)
         log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
     return score
 
 
 async def main() -> None:
     _ = HF_TOKEN
-    client = OpenAI(
-        base_url=API_BASE_URL,
-        api_key=API_KEY or "missing",
-        timeout=MODEL_TIMEOUT_SECONDS,
-        max_retries=0,
-    )
+    client: OpenAI | None = None
+    if API_KEY:
+        try:
+            client = OpenAI(
+                base_url=API_BASE_URL,
+                api_key=API_KEY,
+                timeout=MODEL_TIMEOUT_SECONDS,
+                max_retries=0,
+            )
+        except Exception as exc:  # pragma: no cover
+            if os.environ.get("LOG_DEBUG") == "1":
+                print(f"[DEBUG] openai_client_init_error: {exc}", flush=True)
+            client = None
+
     for task_id in TASK_ORDER:
-        await run_task(client, task_id)
+        try:
+            await run_task(client, task_id)
+        except Exception as exc:  # pragma: no cover
+            if os.environ.get("LOG_DEBUG") == "1":
+                print(f"[DEBUG] unhandled_task_error task={task_id} error={exc}", flush=True)
+            log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
+            log_end(success=False, steps=0, score=0.0, rewards=[])
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception as exc:  # pragma: no cover
+        if os.environ.get("LOG_DEBUG") == "1":
+            print(f"[DEBUG] fatal_main_error: {exc}", flush=True)
