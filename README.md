@@ -16,8 +16,7 @@ PrivacyOps-X is a practical OpenEnv benchmark for privacy-rights operations. It 
 
 ## Quick links
 
-- Main submission URL: https://mohanreddy1432-privacyops-x.hf.space
-- Hugging Face Space repo URL: https://huggingface.co/spaces/mohanreddy1432/privacyops-x
+- Landing page: https://mohanreddy1432-privacyops-x.hf.space
 - API docs: https://mohanreddy1432-privacyops-x.hf.space/docs
 - ReDoc: https://mohanreddy1432-privacyops-x.hf.space/redoc
 
